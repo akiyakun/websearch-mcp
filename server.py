@@ -3,6 +3,7 @@ import os
 import json
 import logging
 from ipaddress import ip_address
+from typing import Literal
 
 from usage_limits import UsageLimits, BudgetExceeded
 
@@ -48,10 +49,17 @@ Use the query's language. Keep the entire result concise and within the output b
 
 
 @mcp.tool()
-async def web_search(query: str) -> str:
+async def web_search(
+    query: str, search_context_size: Literal["low", "medium", "high"] = "low"
+) -> str:
     """低コストの限定 Web 検索。最大5件のタイトル・URL・主要情報・短い要約を返す。
+    search_context_size は原則 low（価格・日付・単純な事実確認）。
+    検索情報の詳細が必要な場合のみ medium、さらに多い情報が必要な場合のみ high。
+    medium/high は費用が増える可能性がある。件数を増やすためには変更しない。
     網羅調査・最安値保証は行わない。比較・考察は呼び出し側で行い、件数を埋めるための反復呼び出しを避ける。
     """
+    if search_context_size not in ("low", "medium", "high"):
+        raise ToolError("search_context_size は low / medium / high で指定してください。")
     query = query.strip()
     if not query:
         raise ToolError("検索文字列を入力してください。")
@@ -76,7 +84,7 @@ async def web_search(query: str) -> str:
         response = await client.responses.create(
             model=MODEL,
             instructions=INSTRUCTIONS,
-            tools=[{"type": "web_search", "search_context_size": "low"}],
+            tools=[{"type": "web_search", "search_context_size": search_context_size}],
             tool_choice="required",
             max_tool_calls=1,
             reasoning={"effort": "none"},
@@ -115,6 +123,7 @@ async def web_search(query: str) -> str:
         "input_tokens": usage.input_tokens if usage else None,
         "output_tokens": usage.output_tokens if usage else None,
         "web_search_calls": calls,
+        "search_context_size": search_context_size,
     }
     # キー・クエリ・検索本文はログに残さない。stdio の通信を壊さないよう stderr へ。
     logger.info("search_usage response_id=%s model=%s status=%s usage=%s",

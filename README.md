@@ -20,7 +20,7 @@ OpenAI の Web 検索
 - 通信方式：Streamable HTTP（Docker）／stdio（ローカル開発）
 - HTTP エンドポイント：`/mcp`
 - コンテナ内の待ち受けポート：`8000`
-- 公開ツール：`web_search(query: str)`
+- 公開ツール：`web_search(query: str, search_context_size="low")`
 - 使用モデル：`gpt-5.6-luna`
 
 認証は実装していません。信頼できるネットワーク内で利用し、そのままインターネットへ公開しないでください。
@@ -107,7 +107,7 @@ OpenAI API キーはサーバー側に設定するため、クライアントへ
 
 ## 検索結果とコスト制限
 
-`web_search(query)` は、次のフィールドを含む JSON テキストを返します。
+`web_search(query, search_context_size="low")` は、次のフィールドを含む JSON テキストを返します。
 
 | フィールド | 内容 |
 | --- | --- |
@@ -123,7 +123,7 @@ OpenAI API キーはサーバー側に設定するため、クライアントへ
 | モデル | `gpt-5.6-luna` |
 | 推論 | `reasoning.effort="none"` |
 | API 応答内の検索ツール呼び出し | 最大1回 |
-| 検索コンテキスト | `low` |
+| 検索コンテキスト | `low`（既定）／`medium`／`high` を呼び出し側で選択 |
 | 生成 tokens | 最大1,200（推論分を含む） |
 | 検索文字列 | 500文字以内 |
 | 各結果の長さ | タイトル120・URL1,000・主要情報200・要約120文字以内 |
@@ -140,6 +140,32 @@ Web 検索にはモデルの token 料金に加え、ツールの利用料金が
 - [モデル仕様](https://developers.openai.com/api/docs/models/gpt-5.6-luna)
 - [Web 検索の仕様](https://developers.openai.com/api/docs/guides/tools-web-search)
 - [API 料金](https://developers.openai.com/api/docs/pricing)
+
+### 検索コンテキストの選択
+
+MCP クライアントは `search_context_size` 引数に `low`・`medium`・`high` を指定できます。
+省略時は `low` なので、従来の `query` だけの呼び出しも利用できます。
+ツールのスキーマと説明に選択肢を公開し、クライアントの AI が内容に応じて選べるようにしています。
+
+```json
+{"query": "DDR4メモリの販売価格を検索", "search_context_size": "low"}
+```
+
+価格・日付・単純な事実確認は `low` を基本とします。検索結果の詳細が必要な場合のみ
+`medium`、さらに多くの情報が必要な場合のみ `high` を使います。
+これはモデルに渡す検索情報量の指定であり、検索件数・ページ数や厳密な token 数の指定ではありません。
+`low` にすれば各依頼の総料金が必ず下がるわけではなく、繰り返し呼び出せば費用は増えます。
+結果5件・検索1回・出力1,200 tokens・サーバー全体の予算は、どの値でも維持します。
+トークン予約値も自動増加しないため、情報量を増やす際は予約値と実使用量の差に注意してください。
+選択値は戻り値の `usage.search_context_size` と使用量ログに含めます。
+
+確認用クライアントでは次のように指定できます。
+
+```sh
+python check_mcp.py --url "http://<server-host>:<published-port>/mcp" --search-context-size low "DDR4メモリの販売価格を検索"
+```
+
+更新後はコンテナを再ビルド・再作成し、MCP クライアントを再接続してツール定義を再取得してください。
 
 ## サーバー全体の使用量上限
 

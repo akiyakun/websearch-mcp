@@ -50,6 +50,22 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args["tools"][0]["search_context_size"], "low")
         self.assertEqual(args["text"]["format"]["schema"]["properties"]["results"]["maxItems"], 5)
 
+    async def test_context_choices_through_mcp(self):
+        async with Client(server.mcp) as client:
+            listed = await client.list_tools()
+            schema = listed.tools[0].input_schema
+            self.assertEqual(schema["properties"]["search_context_size"]["enum"], ["low", "medium", "high"])
+            self.assertEqual(schema["properties"]["search_context_size"]["default"], "low")
+            for size in ("low", "medium", "high"):
+                result = await client.call_tool("web_search", {"query": "test", "search_context_size": size})
+                self.assertFalse(result.is_error)
+                self.assertEqual(self.client.responses.create.call_args.kwargs["tools"][0]["search_context_size"], size)
+                self.assertEqual(json.loads(result.content[0].text)["usage"]["search_context_size"], size)
+            self.client.responses.create.reset_mock()
+            result = await client.call_tool("web_search", {"query": "test", "search_context_size": "unlimited"})
+            self.assertTrue(result.is_error)
+            self.client.responses.create.assert_not_awaited()
+
     async def test_budget_blocks_before_api(self):
         os.environ["SEARCH_MAX_CALLS_PER_WINDOW"] = "1"
         await server.web_search("test")

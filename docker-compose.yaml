@@ -1,7 +1,7 @@
 services:
   websearch-mcp:
     build: .
-    image: websearch-mcwebsearch-mcpp:1.0.0-alpha.4
+    image: websearch-mcwebsearch-mcpp:1.0.0-alpha.5
     container_name: websearch-mcp
 
     restart: unless-stopped

@@ -15,6 +15,7 @@ async def main() -> int:
     parser.add_argument("query", nargs="?", default="Model Context Protocolとは何ですか？公式サイトを検索し、日本語で短く説明してください。")
     parser.add_argument("--list-only", action="store_true", help="ツール一覧だけ取得する（API 呼び出しなし）")
     parser.add_argument("--url", help="起動済みの HTTP MCP サーバーへ接続する URL")
+    parser.add_argument("--search-context-size", choices=("low", "medium", "high"), default="low", help="検索情報量（既定: low）")
     args = parser.parse_args()
 
     # MCP の子プロセスには、必要な環境変数を明示的に渡します。
@@ -41,7 +42,7 @@ async def main() -> int:
         if args.list_only:
             return 0
         print("MCP 経由で検索中です（OpenAI API の利用料金が発生します）…", flush=True)
-        result = await client.call_tool("web_search", {"query": args.query})
+        result = await client.call_tool("web_search", {"query": args.query, "search_context_size": args.search_context_size})
         for content in result.content:
             if content.type == "text":
                 print(content.text)
