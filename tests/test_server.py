@@ -1,123 +1,241 @@
-"""API 料金を発生させず、コスト制限と MCP の返却を確認するテスト。"""
+"""API 料金を発生させず、コスト制限・HTTP ガード・MCP の返却を確認するテスト。"""
+import asyncio
 import json
 import os
-import unittest
+import sqlite3
 import tempfile
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+from dataclasses import replace
+from datetime import datetime
+from pathlib import Path
+from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
-from mcp import Client
+import httpx2 as httpx
 from mcp.server.mcpserver.exceptions import ToolError
+from openai import AsyncOpenAI
+from starlette.testclient import TestClient
 
-import server
+from server import create_http_app, create_server
+from websearch_mcp.budget import BudgetError, reserve, settle
+from websearch_mcp.config import Settings
+from websearch_mcp.search import search
+
+TOKEN = "test-token-" + "a" * 32
+RESULT = {"title": "DDR5 32GB", "url": "https://example.com/item",
+          "facts": "税込12,000円。送料未確認。", "summary": "32GBキットの販売情報。"}
 
 
-class SearchTests(unittest.IsolatedAsyncioTestCase):
+class Fixture(unittest.TestCase):
     def setUp(self):
-        folder = tempfile.TemporaryDirectory()
-        self.addCleanup(folder.cleanup)
-        self.env = patch.dict(os.environ, {"OPENAI_API_KEY": "test-only", "OPENAI_MODEL": server.MODEL, "SEARCH_USAGE_DB": folder.name + "/usage.db", "SEARCH_MAX_CALLS_PER_WINDOW": "100", "SEARCH_MAX_CALLS_PER_DAY": "100", "SEARCH_MAX_TOKENS_PER_DAY": "10000000"})
-        self.env.start()
-        self.addCleanup(self.env.stop)
-        self.result = {"title": "DDR5 32GB", "url": "https://example.com/item", "facts": "税込12,000円。送料未確認。", "summary": "32GBキットの販売情報。"}
-        self.response = SimpleNamespace(
-            id="test-response", status="completed",
-            usage=SimpleNamespace(input_tokens=2000, output_tokens=300),
-            output=[SimpleNamespace(type="web_search_call")],
-            output_text=json.dumps({"results": [self.result]}),
-        )
-        self.client = AsyncMock()
-        self.client.__aenter__.return_value = self.client
-        self.client.responses.create.return_value = self.response
-        self.factory = patch.object(server, "AsyncOpenAI", return_value=self.client)
-        self.factory_mock = self.factory.start()
-        self.addCleanup(self.factory.stop)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.settings = Settings("gpt-5.6-luna", 1200, self.root / "usage.db",
+                                 600, 100, 100, 10_000_000, 12000, ZoneInfo("Asia/Tokyo"))
+        env = patch.dict(os.environ, {"OPENAI_API_KEY": "test-secret-never-log", "WEBSEARCH_MCP_TOKEN": TOKEN})
+        env.start()
+        self.addCleanup(env.stop)
 
-    async def test_mcp_result_and_cost_controls(self):
-        async with Client(server.mcp) as client:
-            result = await client.call_tool("web_search", {"query": "DDRメモリ 最安値トップ10"})
-        self.assertFalse(result.is_error)
-        data = json.loads(result.content[0].text)
-        self.assertEqual(data["results"], [self.result])
+    def api(self, status=200, response_status="completed", text=None, searched=True, usage=True):
+        self.requests = []
+
+        def handler(request):
+            self.requests.append(request)
+            if status != 200:
+                return httpx.Response(status, json={"error": {"message": "test-secret-never-log query", "type": "server_error"}})
+            output = [{"id": "ws_test", "type": "web_search_call", "status": "completed",
+                       "action": {"type": "search", "query": "q"}}] if searched else []
+            output.append({"id": "msg_test", "type": "message", "role": "assistant", "status": "completed",
+                           "content": [{"type": "output_text", "annotations": [],
+                                        "text": json.dumps({"results": [RESULT]}) if text is None else text}]})
+            body = {"id": "resp_test", "object": "response", "created_at": 1,
+                    "status": response_status, "model": "gpt-5.6-luna", "output": output}
+            if usage:
+                body["usage"] = {"input_tokens": 2000, "output_tokens": 300, "total_tokens": 2300,
+                                 "input_tokens_details": {"cached_tokens": 0},
+                                 "output_tokens_details": {"reasoning_tokens": 0}}
+            return httpx.Response(200, json=body)
+
+        def factory(**kwargs):
+            # Exercise the real SDK serializer and HTTP error handling without external calls.
+            supplied = kwargs.pop("http_client")
+            asyncio.get_running_loop().create_task(supplied.aclose())
+            return AsyncOpenAI(**kwargs, http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+        return patch("websearch_mcp.search.AsyncOpenAI", side_effect=factory)
+
+    def run_search(self, query="test", size="low", settings=None):
+        return asyncio.run(search(settings or self.settings, query, size))
+
+    def rows(self):
+        with closing(sqlite3.connect(self.settings.usage_db)) as db:
+            return db.execute("SELECT tokens, settled FROM requests ORDER BY id").fetchall()
+
+
+class ApiTests(Fixture):
+    def test_request_and_output(self):
+        with self.api():
+            data = json.loads(self.run_search("DDRメモリ 最安値トップ10"))
+        self.assertEqual(data["results"], [RESULT])
         self.assertEqual(data["usage"]["input_tokens"], 2000)
-        self.factory_mock.assert_called_once_with(max_retries=0, timeout=60.0)
-        self.client.responses.create.assert_awaited_once()
-        args = self.client.responses.create.call_args.kwargs
-        self.assertEqual(args["model"], "gpt-5.6-luna")
-        self.assertEqual(args["max_tool_calls"], 1)
-        self.assertEqual(args["max_output_tokens"], 1200)
-        self.assertEqual(args["reasoning"], {"effort": "none"})
-        self.assertEqual(args["tools"][0]["search_context_size"], "low")
-        self.assertEqual(args["text"]["format"]["schema"]["properties"]["results"]["maxItems"], 5)
+        self.assertEqual(len(self.requests), 1)
+        req = self.requests[0]
+        self.assertEqual(str(req.url), "https://api.openai.com/v1/responses")
+        body = json.loads(req.content)
+        self.assertEqual(body["model"], "gpt-5.6-luna")
+        self.assertFalse(body["store"])
+        self.assertEqual(body["max_tool_calls"], 1)
+        self.assertEqual(body["max_output_tokens"], 1200)
+        self.assertEqual(body["reasoning"], {"effort": "none"})
+        self.assertEqual(body["tools"][0]["search_context_size"], "low")
+        self.assertEqual(body["text"]["format"]["schema"]["properties"]["results"]["maxItems"], 5)
+        self.assertEqual(self.rows(), [(2300, 1)])
 
-    async def test_context_choices_through_mcp(self):
-        async with Client(server.mcp) as client:
-            listed = await client.list_tools()
-            schema = listed.tools[0].input_schema
-            self.assertEqual(schema["properties"]["search_context_size"]["enum"], ["low", "medium", "high"])
-            self.assertEqual(schema["properties"]["search_context_size"]["default"], "low")
-            for size in ("low", "medium", "high"):
-                result = await client.call_tool("web_search", {"query": "test", "search_context_size": size})
-                self.assertFalse(result.is_error)
-                self.assertEqual(self.client.responses.create.call_args.kwargs["tools"][0]["search_context_size"], size)
-                self.assertEqual(json.loads(result.content[0].text)["usage"]["search_context_size"], size)
-            self.client.responses.create.reset_mock()
-            result = await client.call_tool("web_search", {"query": "test", "search_context_size": "unlimited"})
-            self.assertTrue(result.is_error)
-            self.client.responses.create.assert_not_awaited()
+    def test_context_sizes(self):
+        for size in ("low", "medium", "high"):
+            with self.subTest(size=size), self.api():
+                data = json.loads(self.run_search(size=size))
+                self.assertEqual(json.loads(self.requests[0].content)["tools"][0]["search_context_size"], size)
+                self.assertEqual(data["usage"]["search_context_size"], size)
 
-    async def test_budget_blocks_before_api(self):
-        os.environ["SEARCH_MAX_CALLS_PER_WINDOW"] = "1"
-        await server.web_search("test")
-        with self.assertRaises(ToolError):
-            await server.web_search("test again")
-        self.client.responses.create.assert_awaited_once()
+    def test_invalid_inputs_never_call_api(self):
+        with self.api():
+            for query, size in ((" ", "low"), ("a" * 501, "low"), ("test", "unlimited")):
+                with self.assertRaises(ToolError):
+                    self.run_search(query, size)
+            self.assertFalse(self.requests)
+        self.assertFalse(self.settings.usage_db.exists())
 
-    async def test_api_failure_still_uses_call_budget(self):
-        os.environ["SEARCH_MAX_CALLS_PER_DAY"] = "1"
-        self.client.responses.create.side_effect = TimeoutError("test timeout")
-        with self.assertRaises(TimeoutError):
-            await server.web_search("test")
-        with self.assertRaises(ToolError):
-            await server.web_search("retry")
-        self.client.responses.create.assert_awaited_once()
+    def test_api_error_no_secret_or_retry_and_still_counted(self):
+        with self.api(status=500), self.assertRaises(ToolError) as exc:
+            self.run_search()
+        self.assertNotIn("test-secret", str(exc.exception))
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.rows(), [(12000, 0)])
 
-    async def test_rejects_costly_environment_before_api(self):
-        os.environ["OPENAI_MODEL"] = "gpt-5.6-sol"
-        with self.assertRaises(ToolError):
-            await server.web_search("test")
-        self.factory_mock.assert_not_called()
+    def test_incomplete_not_retried(self):
+        with self.api(response_status="incomplete"), self.assertRaises(ToolError):
+            self.run_search()
+        self.assertEqual(len(self.requests), 1)
 
-    async def test_query_limits_before_api(self):
-        for query in (" ", "a" * 501):
+    def test_bad_or_oversized_results_not_retried(self):
+        for text in ('{"results":', json.dumps({"results": [RESULT] * 6}),
+                     json.dumps({"results": [{**RESULT, "facts": "x" * 201}]}),
+                     json.dumps({"results": [{**RESULT, "url": "file:///secret"}]})):
+            with self.subTest(text=text[:30]), self.api(text=text), self.assertRaises(ToolError):
+                self.run_search()
+            self.assertEqual(len(self.requests), 1)
+
+    def test_no_search_not_presented_as_search(self):
+        with self.api(searched=False), self.assertRaises(ToolError):
+            self.run_search()
+
+    def test_unknown_usage_keeps_reservation(self):
+        with self.api(usage=False):
+            self.run_search()
+        self.assertEqual(self.rows(), [(12000, 0)])
+
+    def test_empty_results_are_valid(self):
+        with self.api(text='{"results": []}'):
+            self.assertEqual(json.loads(self.run_search())["results"], [])
+
+    def test_budget_blocks_before_api(self):
+        settings = replace(self.settings, calls_per_day=1)
+        with self.api():
+            self.run_search(settings=settings)
             with self.assertRaises(ToolError):
-                await server.web_search(query)
-        self.factory_mock.assert_not_called()
+                self.run_search(settings=settings)
+        self.assertEqual(len(self.requests), 1)
 
-    async def test_incomplete_not_retried(self):
-        self.response.status = "incomplete"
-        with self.assertRaises(ToolError):
-            await server.web_search("test")
-        self.client.responses.create.assert_awaited_once()
+    def test_budget_store_failure_closed(self):
+        with self.api(), self.assertRaises(ToolError):
+            self.run_search(settings=replace(self.settings, usage_db=self.root / "missing" / "db"))
+        self.assertFalse(self.requests)
 
-    async def test_bad_or_oversized_results_not_retried(self):
-        for text in ('{"results":', json.dumps({"results": [self.result] * 6}),
-                     json.dumps({"results": [{**self.result, "facts": "x" * 201}]}),
-                     json.dumps({"results": [{**self.result, "url": "file:///secret"}]})):
-            self.client.responses.create.reset_mock()
-            self.response.output_text = text
-            with self.assertRaises(ToolError):
-                await server.web_search("test")
-            self.client.responses.create.assert_awaited_once()
 
-    async def test_no_search_not_presented_as_search(self):
-        self.response.output = []
-        with self.assertRaises(ToolError):
-            await server.web_search("test")
+class BudgetTests(Fixture):
+    def setUp(self):
+        super().setUp()
+        self.settings = replace(self.settings, calls_per_window=3, calls_per_day=20, tokens_per_day=200000)
 
-    async def test_empty_results_are_valid(self):
-        self.response.output_text = '{"results": []}'
-        self.assertEqual(json.loads(await server.web_search("test"))["results"], [])
+    def test_parallel_reservations_stop_at_three(self):
+        def attempt(_):
+            try:
+                reserve(self.settings)
+                return 1
+            except BudgetError:
+                return 0
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            self.assertEqual(sum(pool.map(attempt, range(12))), 3)
+
+    def test_persistent_window_and_expiry(self):
+        with patch("websearch_mcp.budget.time.time", return_value=100000):
+            for _ in range(3):
+                reserve(self.settings)
+            with self.assertRaises(BudgetError):
+                reserve(self.settings)
+        with patch("websearch_mcp.budget.time.time", return_value=100600):
+            reserve(self.settings)
+
+    def test_daily_calls_and_tokyo_midnight(self):
+        settings = replace(self.settings, calls_per_day=1)
+        start = datetime(2026, 10, 7, 23, 0, tzinfo=ZoneInfo("Asia/Tokyo")).timestamp()
+        with patch("websearch_mcp.budget.time.time", return_value=start):
+            reserve(settings)
+        with patch("websearch_mcp.budget.time.time", return_value=start + 700), self.assertRaises(BudgetError):
+            reserve(settings)
+        with patch("websearch_mcp.budget.time.time", return_value=start + 3600):
+            reserve(settings)
+
+    def test_tokens_reserve_settle_and_overshoot(self):
+        settings = replace(self.settings, tokens_per_day=20000)
+        first = reserve(settings)
+        with self.assertRaises(BudgetError):
+            reserve(settings)
+        settle(settings, first, 2000)
+        second = reserve(settings)
+        settle(settings, second, 30000)
+        with self.assertRaises(BudgetError):
+            reserve(settings)
+
+    def test_invalid_config_and_corrupt_store(self):
+        with patch.dict(os.environ, {"SEARCH_MAX_CALLS_PER_DAY": "0"}), self.assertRaises(ValueError):
+            Settings.from_env()
+        self.settings.usage_db.write_text("broken database")
+        with self.assertRaises(Exception):
+            reserve(self.settings)
+
+
+class HttpTests(Fixture):
+    def test_mcp_roundtrip_and_guards(self):
+        headers = {"Authorization": "Bearer " + TOKEN, "Accept": "application/json, text/event-stream"}
+        with patch.dict(os.environ, {"MCP_ALLOWED_HOSTS": "testserver"}):
+            app = create_http_app(create_server(self.settings))
+        with self.api(), TestClient(app) as client:
+            self.assertEqual(client.post("/mcp", json={}).status_code, 401)
+            self.assertEqual(client.post("/mcp", headers={**headers, "Host": "evil.example"}, json={}).status_code, 421)
+            self.assertEqual(client.post("/mcp", headers={**headers, "Origin": "https://evil.example"}, json={}).status_code, 403)
+            init = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}})
+            self.assertEqual(init.status_code, 200, init.text)
+            headers["MCP-Protocol-Version"] = init.json()["result"]["protocolVersion"]
+            listing = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"}).json()
+            tools = listing["result"]["tools"]
+            self.assertEqual([t["name"] for t in tools], ["web_search"])
+            size = tools[0]["inputSchema"]["properties"]["search_context_size"]
+            self.assertEqual((size["enum"], size["default"]), (["low", "medium", "high"], "low"))
+            result = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "web_search", "arguments": {"query": "test"}}}).json()["result"]
+            self.assertFalse(result.get("isError"), result)
+            self.assertEqual(json.loads(result["content"][0]["text"])["results"], [RESULT])
+            oversized = client.post("/mcp", headers=headers, json={"data": "x" * 17000})
+            self.assertEqual(oversized.status_code, 413)
+
+    def test_missing_auth_configuration_rejected(self):
+        with patch.dict(os.environ, {"WEBSEARCH_MCP_TOKEN": ""}), self.assertRaises(ValueError):
+            create_http_app(create_server(self.settings))
 
 
 if __name__ == "__main__":

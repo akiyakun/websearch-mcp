@@ -219,5 +219,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Local API usage counters
+# Websearch secrets and usage data
+.env
+.env.*
+!.env.example
 .usage/
+*.sqlite3
+*.sqlite3-*

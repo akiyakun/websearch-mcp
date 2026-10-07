@@ -1,9 +1,5 @@
-.git
-.venv
-.env
-.env.*
-__pycache__
-*.pyc
-.DS_Store
-
-.usage
+**
+!requirements.txt
+!server.py
+!websearch_mcp/
+!websearch_mcp/*.py
