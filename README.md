@@ -26,8 +26,8 @@ MCPツールは `web_search` だけです。画像解析は別サーバーの `v
 OPENAI_API_KEY=自分のOpenAI_APIキー
 OPENAI_MODEL=gpt-5.6-luna
 WEBSEARCH_MCP_TOKEN=別途生成した32文字以上のランダム文字列
-MCP_BIND_IP=192.168.0.49
-SERVER_IP=192.168.0.49
+MCP_BIND_IP=192.168.0.100
+SERVER_IP=192.168.0.100
 MCP_PORT=8101
 MCP_ALLOWED_HOSTS=localhost:*,127.0.0.1:*
 ```
@@ -61,7 +61,7 @@ docker compose logs --tail=30 websearch-mcp
 {
   "mcp_servers": {
     "websearch-mcp": {
-      "url": "http://192.168.0.49:8101/mcp",
+      "url": "http://192.168.0.100:8101/mcp",
       "headers": {
         "Authorization": "Bearer .envのWEBSEARCH_MCP_TOKENと同じ値"
       }
@@ -152,13 +152,13 @@ python -m venv .venv
 接続確認は環境変数`WEBSEARCH_MCP_TOKEN`を設定したシェルで:
 
 ```bash
-.venv/bin/python check_mcp.py http://192.168.0.49:8101/mcp
+.venv/bin/python check_mcp.py http://192.168.0.100:8101/mcp
 ```
 
 この確認はinitializeとtools/listだけで、OpenAIを呼びません。実検索で1回だけ確認する場合（課金・使用量上限の対象）:
 
 ```bash
-.venv/bin/python check_mcp.py http://192.168.0.49:8101/mcp --query "Pythonの公式サイト" --search-context-size low
+.venv/bin/python check_mcp.py http://192.168.0.100:8101/mcp --query "Pythonの公式サイト" --search-context-size low
 ```
 
 ローカル開発でHTTPを起動する場合、`.env`の値をシェル環境に設定し、`SEARCH_USAGE_DB`を存在するローカル保存先へ設定してから`python server.py --http`を実行します。`--http`なしはstdioです。stdioの標準出力はMCP通信専用なので、デバッグ出力を追加しないでください。
